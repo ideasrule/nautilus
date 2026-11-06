@@ -81,6 +81,9 @@ def test_sampler_errors_and_warnings():
     with pytest.raises(ValueError):
         Sampler(prior, likelihood, 1)
 
+    with pytest.raises(ValueError):
+        Sampler(prior, likelihood, 2, neural_network_backend='torch')
+
     sampler = Sampler(prior, likelihood, 2, n_live=300)
     sampler.run(n_like_max=1000, verbose=True)
 
@@ -166,8 +169,15 @@ def test_sampler_prior(custom_prior, vectorized, pass_dict):
 
 @pytest.mark.parametrize("n_networks", [0, 4])
 @pytest.mark.parametrize("discard_exploration", [True, False])
-def test_sampler_accuracy(n_networks, discard_exploration):
+@pytest.mark.parametrize("neural_network_backend", ['sklearn', 'jax'])
+def test_sampler_accuracy(n_networks, discard_exploration,
+                          neural_network_backend):
     # Do a basic tests of the sampler accuracy.
+
+    if neural_network_backend == 'jax':
+        if n_networks == 0:
+            pytest.skip('No networks are trained.')
+        pytest.importorskip('jax')
 
     n_dim = 2
     mean = np.repeat(0.5, n_dim)
@@ -180,7 +190,8 @@ def test_sampler_accuracy(n_networks, discard_exploration):
         return multivariate_normal.logpdf(x, mean=mean, cov=cov)
 
     sampler = Sampler(prior, likelihood, n_dim=n_dim, n_live=500,
-                      n_networks=n_networks, seed=0)
+                      n_networks=n_networks, seed=0,
+                      neural_network_backend=neural_network_backend)
     sampler.run(discard_exploration=discard_exploration, f_live=0.1,
                 verbose=True)
 

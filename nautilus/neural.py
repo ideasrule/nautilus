@@ -1,5 +1,6 @@
 """Module implementing neural network emulators."""
 
+import os
 import warnings
 from functools import partial
 
@@ -48,8 +49,13 @@ class NeuralNetworkEmulator:
 
     """
 
+    # Minimum number of points for which to predict on the GPU, if the
+    # emulator was trained there. For fewer points, numpy is faster.
+    gpu_predict_min_points = 64
+
     @classmethod
-    def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None):
+    def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None,
+              backend='sklearn'):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -64,7 +70,16 @@ class NeuralNetworkEmulator:
             Non-default keyword arguments passed to the constructor of
             MLPRegressor. Default is `None`.
         pool : multiprocessing.Pool, optional
-            Pool used for parallel processing.
+            Pool used for parallel processing. Ignored by the 'jax' and
+            'cuda' backends.
+        backend : str, optional
+            Library used for training: 'sklearn', 'jax' or 'cuda'. The 'jax'
+            backend trains all networks simultaneously in a single compiled
+            call, which is much faster, especially on a GPU. The 'cuda'
+            backend trains them in a single fused CUDA kernel, which is
+            faster still but requires CuPy and an NVIDIA GPU. Both fall back
+            to 'sklearn' for settings they do not support. Default is
+            'sklearn'.
 
         Returns
         -------
@@ -90,8 +105,30 @@ class NeuralNetworkEmulator:
             neural_network_kwargs = neural_network_kwargs.copy()
             del neural_network_kwargs['random_state']
 
-        f = partial(train_network, (x - emulator.mean) / emulator.scale, y,
-                    neural_network_kwargs)
+        x = (x - emulator.mean) / emulator.scale
+
+        if backend not in ['sklearn', 'jax', 'cuda']:
+            raise ValueError(f"Unknown neural network backend '{backend}'.")
+
+        if backend in ['jax', 'cuda']:
+            if backend == 'jax':
+                from . import _jax_mlp as module
+            else:
+                from . import _cuda_mlp as module
+            if module.is_supported(neural_network_kwargs, x.shape[1],
+                                   n_networks):
+                emulator.neural_networks = module.train_networks(
+                    x, y, n_networks, neural_network_kwargs)
+                # Also predict on the GPU, but only in this process. Copies
+                # of the emulator sent to worker processes use numpy.
+                emulator.gpu_backend = backend
+                emulator.gpu_pid = os.getpid()
+                return emulator
+            warnings.warn(f"The '{backend}' backend does not support these" +
+                          " neural network settings or is not available." +
+                          " Using 'sklearn' instead.", Warning, stacklevel=2)
+
+        f = partial(train_network, x, y, neural_network_kwargs)
 
         if pool is None:
             emulator.neural_networks = list(map(f, range(n_networks)))
@@ -114,9 +151,75 @@ class NeuralNetworkEmulator:
             Emulated normalized likelihood value of the training points.
 
         """
-        return np.mean(
-            [network.predict((x - self.mean) / self.scale) for network in
-             self.neural_networks], axis=0)
+        weights = self._stacked_weights()
+        if weights is None:
+            return np.mean(
+                [network.predict((x - self.mean) / self.scale) for network in
+                 self.neural_networks], axis=0)
+
+        # Evaluate all networks at once. The first layer of every network
+        # is a single matrix product; later layers are batched products.
+        coefs, intercepts = weights
+        n_networks = len(self.neural_networks)
+        x = np.atleast_2d(x)
+        if len(x) == 0:
+            return np.zeros(0)
+        x = ((x - self.mean) / self.scale).astype(np.float32)
+        if (getattr(self, 'gpu_pid', None) == os.getpid() and
+                len(x) >= self.gpu_predict_min_points):
+            if self.gpu_backend == 'jax':
+                from . import _jax_mlp as module
+            else:
+                from . import _cuda_mlp as module
+            return module.predict(self, x)
+        a = x @ coefs[0]
+        a += intercepts[0]
+        np.maximum(a, 0, out=a)
+        a = a.reshape(len(x), n_networks, -1).transpose(1, 0, 2)
+        for i in range(1, len(coefs)):
+            a = np.matmul(a, coefs[i])
+            a += intercepts[i]
+            if i < len(coefs) - 1:
+                np.maximum(a, 0, out=a)
+        return np.mean(a[:, :, 0], axis=0, dtype=np.float64)
+
+    def _stacked_weights(self):
+        """Return the weights of all networks stacked for fast prediction.
+
+        Returns
+        -------
+        weights : tuple or None
+            Coefficients and intercepts of all layers in single precision.
+            The first layer of all networks is concatenated into one matrix,
+            subsequent layers are stacked along a new first axis. None if the
+            networks cannot be evaluated this way, i.e., if they do not use
+            ReLU activations or have differing architectures.
+
+        """
+        if not hasattr(self, '_weights'):
+            networks = self.neural_networks
+            shapes = [[c.shape for c in network.coefs_] for network in
+                      networks]
+            if (any(network.activation != 'relu' or
+                    network.out_activation_ != 'identity' or
+                    network.n_outputs_ != 1 for network in networks) or
+                    any(s != shapes[0] for s in shapes)):
+                self._weights = None
+            else:
+                coefs = [np.concatenate(
+                    [network.coefs_[0] for network in networks], axis=1)]
+                intercepts = [np.concatenate(
+                    [network.intercepts_[0] for network in networks])]
+                for i in range(1, len(shapes[0])):
+                    coefs.append(np.stack(
+                        [network.coefs_[i] for network in networks]))
+                    intercepts.append(np.stack(
+                        [network.intercepts_[i] for network in networks])[
+                            :, np.newaxis, :])
+                self._weights = (
+                    [c.astype(np.float32) for c in coefs],
+                    [i.astype(np.float32) for i in intercepts])
+        return self._weights
 
     def write(self, group):
         """Write the emulator to an HDF5 group.

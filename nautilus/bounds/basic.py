@@ -6,6 +6,38 @@ from scipy.special import gammaln
 from threadpoolctl import threadpool_limits
 
 
+def rejection_batch_size(n_needed, n_sample, n_reject, n_min=1000,
+                         n_max=100000):
+    """Choose how many points to draw in one batch of rejection sampling.
+
+    Drawing larger batches reduces the overhead per point. Points not needed
+    right away are kept for later calls, so drawing more than necessary
+    wastes little.
+
+    Parameters
+    ----------
+    n_needed : int
+        Number of accepted points still needed.
+    n_sample : int
+        Number of points drawn so far.
+    n_reject : int
+        Number of points rejected so far.
+    n_min : int, optional
+        Minimum batch size. Default is 1000.
+    n_max : int, optional
+        Maximum batch size. Default is 100000.
+
+    Returns
+    -------
+    n_batch : int
+        Number of points to draw.
+
+    """
+    if n_sample > 0:
+        n_needed = n_needed / max(1 - n_reject / n_sample, 1e-3)
+    return int(min(max(n_min, 1.1 * n_needed), n_max))
+
+
 class UnitCube:
     r"""Unit (hyper)cube bound.
 
@@ -172,6 +204,76 @@ def invert_symmetric_positive_semidefinite_matrix(m):
     return m_inv_triangle + m_inv_triangle.T - np.diag(np.diag(m_inv_triangle))
 
 
+def _khachiyan_updates_numpy(q, u, v_inv, g, select):
+    """Perform Khachiyan updates for a sequence of points in place.
+
+    Parameters
+    ----------
+    q : numpy.ndarray
+        Points with an additional coordinate equal to unity.
+    u : numpy.ndarray
+        Weights of the points. Updated in place.
+    v_inv : numpy.ndarray
+        Inverse of the weighted scatter matrix of `q`. Updated in place.
+    g : numpy.ndarray
+        Values of q_j^T v_inv q_j before any update.
+    select : numpy.ndarray
+        Indices of the points to update in order.
+
+    """
+    n_dim = q.shape[1] - 1
+    for k, j in enumerate(select):
+        w = v_inv @ q[j]
+        g_j = g[j] if k == 0 else q[j] @ w
+        if g_j < n_dim + 1:
+            continue
+        a = (g_j - (n_dim + 1)) / ((n_dim + 1) * (g_j - 1))
+        # The scatter matrix changes as v -> (1 - a) v + a q_j q_j^T. Update
+        # its inverse with the Sherman-Morrison formula.
+        r = a / (1 - a)
+        v_inv -= np.outer(w, w) * (r / (1 + r * g_j))
+        v_inv /= 1 - a
+        u *= 1 - a
+        u[j] += a
+
+
+try:
+    import numba
+except ImportError:
+    _khachiyan_updates = _khachiyan_updates_numpy
+else:
+    @numba.njit(cache=True)
+    def _khachiyan_updates(q, u, v_inv, g, select):  # pragma: no cover
+        """Same as `_khachiyan_updates_numpy` but compiled with numba."""
+        n = q.shape[1]
+        w = np.empty(n)
+        for k in range(len(select)):
+            j = select[k]
+            for a_ in range(n):
+                t = 0.0
+                for b_ in range(n):
+                    t += v_inv[a_, b_] * q[j, b_]
+                w[a_] = t
+            if k == 0:
+                g_j = g[j]
+            else:
+                g_j = 0.0
+                for a_ in range(n):
+                    g_j += q[j, a_] * w[a_]
+            if g_j < n:
+                continue
+            a = (g_j - n) / (n * (g_j - 1))
+            r = a / (1 - a)
+            f = r / (1 + r * g_j)
+            for a_ in range(n):
+                for b_ in range(n):
+                    v_inv[a_, b_] = (v_inv[a_, b_] - f * w[a_] * w[b_]) / (
+                        1 - a)
+            for i in range(len(u)):
+                u[i] *= 1 - a
+            u[j] += a
+
+
 def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20):
     r"""Find an approximation to the minimum volume enclosing ellipsoid (MVEE).
 
@@ -211,24 +313,16 @@ def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20):
     n_points, n_dim = points.shape
     q = np.append(points, np.ones(shape=(n_points, 1)), axis=1)
     u = np.repeat(1.0 / n_points, n_points)
-    q_outer = np.array([np.outer(q_i, q_i) for q_i in q])
+    v_inv = invert_symmetric_positive_semidefinite_matrix((q.T * u) @ q)
+    n_batch = min(n_batch, n_points)
 
     for i in range(n_max):
-        if i % 1000 == 0:
-            v = np.einsum('ji,j,jk', q, u, q)
-            v_inv = invert_symmetric_positive_semidefinite_matrix(v)
-        g = np.einsum('ijk,jk', q_outer, v_inv)
-        for j in np.argsort(g)[-n_batch:][::-1]:
-            try:
-                g = g[j]
-            except IndexError:
-                g = np.einsum('jk,jk', q_outer[j], v_inv)
-            if g < n_dim + 1:
-                continue
-            a = (g - (n_dim + 1)) / ((n_dim + 1) * (g - 1))
-            v = v * (1 - a) + a * q_outer[j]
-            v_inv = invert_symmetric_positive_semidefinite_matrix(v)
-            u = u * (1 - a) + a * (np.arange(n_points) == j)
+        # Equivalent to g_j = q_j^T v_inv q_j for all points j.
+        g = np.einsum('ij,ij->i', q @ v_inv, q)
+        # Points with the largest g in descending order.
+        select = np.argpartition(g, n_points - n_batch)[n_points - n_batch:]
+        select = select[np.argsort(g[select])[::-1]]
+        _khachiyan_updates(q, u, v_inv, g, select)
 
     c = np.atleast_1d(np.average(points, weights=u, axis=0))
     A_inv = np.atleast_2d(np.cov(points, aweights=u, rowvar=False, bias=True))

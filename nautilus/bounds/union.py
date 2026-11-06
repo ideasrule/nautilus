@@ -8,7 +8,8 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal
 from sklearn.mixture import GaussianMixture
 
-from .basic import Ellipsoid, UnitCube, UnitCubeEllipsoidMixture
+from .basic import (Ellipsoid, UnitCube, UnitCubeEllipsoidMixture,
+                    rejection_batch_size)
 
 
 def ellipsoids_overlap(ellipsoids):
@@ -305,20 +306,30 @@ class Union:
 
         """
         while len(self.points) < n_points:
-            n_sample = 1000
+            n_sample = rejection_batch_size(
+                n_points - len(self.points), self.n_sample, self.n_reject)
 
-            p = np.exp(np.array(self.log_v_all) - logsumexp(self.log_v_all))
-            n_per_bound = self.rng.multinomial(n_sample, p)
-
-            points = np.vstack([bound.sample(n) for bound, n in
-                                zip(self.bounds, n_per_bound)])
+            if len(self.bounds) == 1:
+                points = self.bounds[0].sample(n_sample)
+            else:
+                # Assign points to bounds randomly so that they come out in
+                # random order without having to shuffle them.
+                p = np.exp(self.log_v_all - np.amax(self.log_v_all))
+                label = self.rng.choice(len(self.bounds), size=n_sample,
+                                        p=p / np.sum(p))
+                points = np.empty((n_sample, self.n_dim))
+                for i, bound in enumerate(self.bounds):
+                    select = label == i
+                    points[select] = bound.sample(np.sum(select))
             if self.cube is not None:
                 points = points[self.cube.contains(points)]
-            self.rng.shuffle(points)
-            n_bound = np.sum([bound.contains(points) for bound in self.bounds],
-                             axis=0)
-            p = 1 - 1.0 / n_bound
-            points = points[self.rng.random(size=len(points)) > p]
+            if len(self.bounds) > 1:
+                # Correct for overlap by keeping points with a probability
+                # inversely proportional to the number of bounds they are in.
+                n_bound = np.sum([bound.contains(points) for bound in
+                                  self.bounds], axis=0)
+                p = 1 - 1.0 / n_bound
+                points = points[self.rng.random(size=len(points)) > p]
             self.points = np.vstack([self.points, points])
 
             self.n_sample += n_sample

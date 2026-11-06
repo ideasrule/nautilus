@@ -27,8 +27,8 @@ class NeuralBound:
 
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
-                n_networks=4, neural_network_kwargs=None, pool=None,
-                rng=None):
+                n_networks=4, neural_network_kwargs=None,
+                neural_network_backend='sklearn', pool=None, rng=None):
         """Compute a neural network-based bound.
 
         Parameters
@@ -47,6 +47,9 @@ class NeuralBound:
         neural_network_kwargs : dict or None, optional
             Non-default keyword arguments passed to the constructor of
             MLPRegressor. Default is `None`.
+        neural_network_backend : str, optional
+            Library used to train the networks: 'sklearn', 'jax' or 'cuda'.
+            Default is 'sklearn'.
         pool : nautilus.pool.NautilusPool or None, optional
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
@@ -91,7 +94,8 @@ class NeuralBound:
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
         bound.emulator = NeuralNetworkEmulator.train(
             points_t, score, n_networks=n_networks,
-            neural_network_kwargs=neural_network_kwargs, pool=pool)
+            neural_network_kwargs=neural_network_kwargs, pool=pool,
+            backend=neural_network_backend)
 
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),
@@ -119,11 +123,11 @@ class NeuralBound:
 
         in_bound = self.outer_bound.contains(points)
         if np.any(in_bound) and self.emulator is not None:
-            points_t = self.outer_bound.transform(points)
+            points_t = self.outer_bound.transform(points[in_bound])
             # In some instances, the network may predict practically the same
             # score for all input values. Lower the score threshold to prevent
             # no points being accepted in this case.
-            in_bound[in_bound] = (self.emulator.predict(points_t[in_bound]) >
+            in_bound[in_bound] = (self.emulator.predict(points_t) >
                                   self.score_predict_min - 1e-9)
 
         return in_bound

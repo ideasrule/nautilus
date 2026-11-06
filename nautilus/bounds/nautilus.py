@@ -5,7 +5,8 @@ from functools import partial
 import numpy as np
 from threadpoolctl import threadpool_limits
 
-from .basic import Ellipsoid, UnitCubeEllipsoidMixture
+from .basic import (Ellipsoid, UnitCubeEllipsoidMixture,
+                    rejection_batch_size)
 from .neural import NeuralBound
 from .periodic import PhaseShift
 from .union import Union
@@ -41,7 +42,7 @@ class NautilusBound:
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs=None,
-                pool=None, rng=None):
+                neural_network_backend='sklearn', pool=None, rng=None):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -75,6 +76,9 @@ class NautilusBound:
         neural_network_kwargs : dict or None, optional
             Non-default keyword arguments passed to the constructor of
             MLPRegressor. Default is `None`.
+        neural_network_backend : str, optional
+            Library used to train the networks: 'sklearn', 'jax' or 'cuda'.
+            Default is 'sklearn'.
         pool : nautilus.pool.NautilusPool or None, optional
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
@@ -114,7 +118,8 @@ class NautilusBound:
             bound.neural_bounds.append(NeuralBound.compute(
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
-                neural_network_kwargs=neural_network_kwargs, pool=pool,
+                neural_network_kwargs=neural_network_kwargs,
+                neural_network_backend=neural_network_backend, pool=pool,
                 rng=rng))
 
         bound.outer_bound = Union.compute(
@@ -163,13 +168,37 @@ class NautilusBound:
             the bound.
 
         """
+        if np.ndim(points) == 1:
+            return self.contains(points[np.newaxis])[0]
         if self.shift is not None:
             points = self.shift.transform(points)
         in_bound = self.outer_bound.contains(points)
         if len(self.neural_bounds) > 0:
-            in_bound = in_bound & np.any(
-                [bound.contains(points) for bound in self.neural_bounds],
-                axis=0)
+            in_bound[in_bound] = self._in_neural_bounds(points[in_bound])
+        return in_bound
+
+    def _in_neural_bounds(self, points):
+        """Check whether points are contained in any of the neural bounds.
+
+        Parameters
+        ----------
+        points : numpy.ndarray
+            A 2-D array where each row represents a point.
+
+        Returns
+        -------
+        in_bound : numpy.ndarray
+            Array of bools describing for each point whether it is contained
+            in any of the neural bounds.
+
+        """
+        in_bound = np.zeros(len(points), dtype=bool)
+        for bound in self.neural_bounds:
+            # Only evaluate points not already found to be in a bound.
+            todo = ~in_bound
+            if not np.any(todo):
+                break
+            in_bound[todo] = bound.contains(points[todo])
         return in_bound
 
     @threadpool_limits.wrap(limits=1)
@@ -216,11 +245,11 @@ class NautilusBound:
         if len(self.points) < n_points:
             if pool is None:
                 while len(self.points) < n_points:
-                    n_sample = 1000
+                    n_sample = rejection_batch_size(
+                        n_points - len(self.points), self.n_sample,
+                        self.n_reject)
                     points = self.outer_bound.sample(n_sample)
-                    in_bound = np.any([bound.contains(points) for bound in
-                                       self.neural_bounds], axis=0)
-                    points = points[in_bound]
+                    points = points[self._in_neural_bounds(points)]
                     self.points = np.vstack([self.points, points])
                     self.n_sample += n_sample
                     self.n_reject += n_sample - len(points)

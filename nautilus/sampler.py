@@ -55,6 +55,8 @@ class Sampler:
     neural_network_kwargs : dict
         Keyword arguments passed to the constructor of
         `sklearn.neural_network.MLPRegressor`.
+    neural_network_backend : str
+        Library used to train the networks: 'sklearn', 'jax' or 'cuda'.
     n_batch : int
         Number of likelihood evaluations that are performed at each step.
     vectorized : bool
@@ -121,7 +123,8 @@ class Sampler:
     def __init__(self, prior, likelihood, n_dim=None, n_live=2000,
                  n_update=None, enlarge_per_dim=1.1, n_points_min=None,
                  split_threshold=100, periodic=None, n_networks=4,
-                 neural_network_kwargs=None, prior_args=None,
+                 neural_network_kwargs=None,
+                 neural_network_backend='sklearn', prior_args=None,
                  prior_kwargs=None, likelihood_args=None,
                  likelihood_kwargs=None, n_batch=None,
                  n_like_new_bound=None, vectorized=False, pass_dict=None,
@@ -166,6 +169,14 @@ class Sampler:
         neural_network_kwargs : dict or None, optional
             Non-default keyword arguments passed to the constructor of
             MLPRegressor. Default is `None`.
+        neural_network_backend : str, optional
+            Library used to train the networks: 'sklearn', 'jax' or 'cuda'.
+            The 'jax' backend trains all networks of a bound simultaneously
+            in a single compiled call, which is much faster, especially on a
+            GPU. The 'cuda' backend trains them in a single fused CUDA
+            kernel, which is faster still, but requires CuPy and an NVIDIA
+            GPU. Both ignore the pool for training and also predict on the
+            GPU. Default is 'sklearn'.
         prior_args : list or None, optional
             List of extra positional arguments for `prior`. Only used if
             `prior` is a function. Default is `None`.
@@ -291,6 +302,10 @@ class Sampler:
             neural_network_kwargs = {}
 
         self.neural_network_kwargs = neural_network_kwargs
+        if neural_network_backend not in ['sklearn', 'jax', 'cuda']:
+            raise ValueError("Unknown neural network backend " +
+                             f"'{neural_network_backend}'.")
+        self.neural_network_backend = neural_network_backend
         self.vectorized = vectorized
         self.pass_dict = pass_dict
 
@@ -806,9 +821,10 @@ class Sampler:
                 # Remove points that are actually in another shell.
                 in_shell = np.ones(len(points), dtype=bool)
                 for bound in self.bounds[index:][1:]:
-                    in_shell = in_shell & ~bound.contains(points)
-                    if np.all(~in_shell):
-                        continue
+                    if not np.any(in_shell):
+                        break
+                    # Only check points not already excluded.
+                    in_shell[in_shell] = ~bound.contains(points[in_shell])
                 points = points[in_shell]
 
                 # Replace points for which we can use transfer points.
@@ -1041,6 +1057,7 @@ class Sampler:
                         periodic=self.periodic,
                         n_networks=self.n_networks,
                         neural_network_kwargs=self.neural_network_kwargs,
+                        neural_network_backend=self.neural_network_backend,
                         pool=self.pool_s, rng=self.rng)
                     bound.sample(1000, return_points=False, pool=self.pool_s)
 
